@@ -1,95 +1,101 @@
 const express = require('express');
+const path = require('path');
+const session = require('express-session');
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-const cookieParser = require('cookie-parser');
-const db = require('./db');
+const { Client } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'secret_key_very_secure';
 
-// Middleware
+// بيانات الاتصال بقاعدة البيانات (ضع هنا رابط الاتصال الخاص بك)
+const connectionString = 'postgresql://postgres:OESSTSEDkYaSrecZjjNqVwEVscWxPnZT@interchange.proxy.rlwy.net:34758/railway';
+
+const client = new Client({
+  connectionString,
+});
+
+client.connect().then(() => {
+  console.log('Connected to PostgreSQL');
+}).catch(console.error);
+
+// إعدادات الجلسة
+app.use(session({
+  secret: 'secret_store_key_123',
+  resave: false,
+  saveUninitialized: false,
+}));
+
 app.use(express.json());
-app.use(cookieParser());
-app.use(express.static('public')); // يخدم ملفات HTML, CSS, JS في مجلد public
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Middleware لحماية صفحات لوحة التحكم
+function checkAuth(req, res, next) {
+  if (req.session.userId) {
+    next();
+  } else {
+    res.redirect('/login.html');
+  }
+}
+
+// صفحة لوحة التحكم محمية
+app.get('/dashboard.html', checkAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
 
 // تسجيل مستخدم جديد
 app.post('/register', async (req, res) => {
+  const { name, email, password } = req.body;
+  if (!name || !email || !password) {
+    return res.json({ success: false, message: 'جميع الحقول مطلوبة.' });
+  }
   try {
-    const { name, email, password } = req.body;
-    if (!name || !email || !password) {
-      return res.json({ success: false, message: 'يرجى تعبئة جميع الحقول' });
-    }
-
-    // تحقق إذا المستخدم موجود
-    const existingUser = await db.findUserByEmail(email);
-    if (existingUser) {
-      return res.json({ success: false, message: 'البريد الإلكتروني مستخدم مسبقًا' });
-    }
-
     const hashedPassword = await bcrypt.hash(password, 10);
-    await db.addUser(name, email, hashedPassword);
+    // تحقق من وجود المستخدم مسبقًا
+    const userExist = await client.query('SELECT id FROM users WHERE email=$1', [email]);
+    if (userExist.rows.length > 0) {
+      return res.json({ success: false, message: 'البريد الإلكتروني مستخدم مسبقًا.' });
+    }
+    await client.query('INSERT INTO users (name, email, password) VALUES ($1, $2, $3)', [name, email, hashedPassword]);
     res.json({ success: true, message: 'تم إنشاء الحساب بنجاح!' });
-  } catch (error) {
-    console.error(error);
-    res.json({ success: false, message: 'حدث خطأ أثناء التسجيل' });
+  } catch (err) {
+    console.error(err);
+    res.json({ success: false, message: 'حدث خطأ أثناء التسجيل.' });
   }
 });
 
-// تسجيل دخول
+// تسجيل الدخول
 app.post('/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.json({ success: false, message: 'يرجى ملء جميع الحقول.' });
+  }
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.json({ success: false, message: 'يرجى تعبئة جميع الحقول' });
-    }
-
-    const user = await db.findUserByEmail(email);
+    const userRes = await client.query('SELECT * FROM users WHERE email=$1', [email]);
+    const user = userRes.rows[0];
     if (!user) {
-      return res.json({ success: false, message: 'البريد الإلكتروني أو كلمة المرور خاطئة' });
+      return res.json({ success: false, message: 'البريد الإلكتروني غير مسجل.' });
     }
-
     const match = await bcrypt.compare(password, user.password);
     if (!match) {
-      return res.json({ success: false, message: 'البريد الإلكتروني أو كلمة المرور خاطئة' });
+      return res.json({ success: false, message: 'كلمة المرور غير صحيحة.' });
     }
-
-    // إنشاء JWT
-    const token = jwt.sign({ id: user.id, name: user.name, email: user.email }, JWT_SECRET, { expiresIn: '2h' });
-
-    // إرسال الكوكي مع التوكن (httpOnly)
-    res.cookie('token', token, { httpOnly: true, maxAge: 2 * 60 * 60 * 1000 });
-    res.json({ success: true, message: 'تم تسجيل الدخول بنجاح' });
-  } catch (error) {
-    console.error(error);
-    res.json({ success: false, message: 'حدث خطأ أثناء تسجيل الدخول' });
+    req.session.userId = user.id;
+    res.json({ success: true, message: 'تم تسجيل الدخول بنجاح!' });
+  } catch (err) {
+    console.error(err);
+    res.json({ success: false, message: 'حدث خطأ أثناء تسجيل الدخول.' });
   }
-});
-
-// ميدلوير للتحقق من التوكن
-function authMiddleware(req, res, next) {
-  const token = req.cookies.token;
-  if (!token) return res.status(401).json({ message: 'غير مصرح' });
-
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) return res.status(401).json({ message: 'التوكن غير صالح' });
-    req.user = decoded;
-    next();
-  });
-}
-
-// صفحة لوحة التحكم (API)
-app.get('/dashboard', authMiddleware, (req, res) => {
-  res.json({ message: `مرحبا ${req.user.name} في لوحة التحكم` });
 });
 
 // تسجيل خروج
 app.post('/logout', (req, res) => {
-  res.clearCookie('token');
-  res.json({ message: 'تم تسجيل الخروج' });
+  req.session.destroy(() => {
+    res.json({ success: true });
+  });
 });
 
-// بدء السيرفر
+// بدء الخادم
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
